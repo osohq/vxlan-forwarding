@@ -203,9 +203,9 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<String>>();
 
-    let [_, interface, source_port, forward_addr] = &args[..] else {
+    let [_, interface, expected_vni, source_port, forward_addr] = &args[..] else {
         println!(
-            "Usage: {} <interface> <source_port> <forward_addr>",
+            "Usage: {} <interface> <vni> <source_port> <forward_addr>",
             args[0]
         );
         exit(1);
@@ -213,6 +213,8 @@ fn main() {
     // let [_, interface, source_port, forward_addr] =
     //     ["packetdump", "dummy0", "8000", "127.0.0.1:8081"];
     let source_port: u16 = source_port.parse().expect("failed to parse source port");
+    let expected_vni: u32 = expected_vni.parse().expect("failed to parse VNI");
+
     let forward_addr = forward_addr
         .to_socket_addrs()
         .expect("failed to parse address")
@@ -325,7 +327,7 @@ fn main() {
                 tracing::info_span!("thread", %i).in_scope(|| loop {
                     match rx.next() {
                         Ok(packet) => {
-                            forward_packet(&conn_manager, source_port, packet);
+                            forward_packet(&conn_manager, source_port, expected_vni, packet);
                         }
                         Err(e) => {
                             tracing::error!("An error occurred while reading: {e}");
@@ -345,7 +347,12 @@ fn main() {
     }
 }
 
-fn forward_packet(conn_manager: &ConnectionManager, source_port: u16, packet: &[u8]) -> Option<()> {
+fn forward_packet(
+    conn_manager: &ConnectionManager,
+    source_port: u16,
+    expected_vni: u32,
+    packet: &[u8],
+) -> Option<()> {
     let packet = EthernetPacket::new(packet)?;
     if packet.get_ethertype() != EtherTypes::Ipv4 {
         tracing::trace!("not an IPv4 packet");
@@ -364,8 +371,9 @@ fn forward_packet(conn_manager: &ConnectionManager, source_port: u16, packet: &[
         tracing::debug!("Not a VXLAN packet");
         return None;
     };
-    if vxlan.get_vni() != 42 {
-        tracing::warn!("Invalid VNI");
+    let vni = vxlan.get_vni();
+    if vni != expected_vni {
+        tracing::warn!(%vni, "Invalid VNI");
         return None;
     }
     let Some(ethernet) = EthernetPacket::new(vxlan.payload()) else {
