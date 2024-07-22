@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    net::{SocketAddrV4, TcpStream},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     process::exit,
     sync::{
         mpsc::{RecvTimeoutError, Sender},
@@ -87,7 +87,7 @@ impl Connection {
 }
 
 struct TcpConnector {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
 }
 
 impl r2d2::ManageConnection for TcpConnector {
@@ -145,12 +145,12 @@ struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    fn new(forward_addr: SocketAddrV4, events: Sender<(ConnectionKey, bool)>) -> Self {
+    fn new(forward_addr: SocketAddr, events: Sender<(ConnectionKey, bool)>) -> Self {
         let conn_map: ConnectionMap = ConnectionMap::with_capacity_and_shard_amount(512, 32);
         let pool = r2d2::Pool::builder()
             .max_size(128)
             .min_idle(Some(4))
-            .connection_timeout(Duration::from_secs(10))
+            .connection_timeout(Duration::from_secs(30))
             .build(TcpConnector { addr: forward_addr })
             .expect("Failed to create connection pool");
         Self {
@@ -214,8 +214,10 @@ fn main() {
     //     ["packetdump", "dummy0", "8000", "127.0.0.1:8081"];
     let source_port: u16 = source_port.parse().expect("failed to parse source port");
     let forward_addr = forward_addr
-        .parse()
-        .expect("failed to parse forward address");
+        .to_socket_addrs()
+        .expect("failed to parse address")
+        .next()
+        .expect("did not find any address");
 
     // Get a vector with all network interfaces found
     let all_interfaces = interfaces();
