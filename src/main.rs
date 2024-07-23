@@ -56,7 +56,12 @@ impl Connection {
         if seq == self.next_seq {
             // eagerly send the data
             tracing::trace!(%seq, "this is already the next packet");
-            self.stream.write_all(data).unwrap();
+            if let Err(e) = self.stream.write_all(data) {
+                // just close the connection and abandon it
+                self.closed = true;
+                tracing::error!(%e, "Failed to write data");
+                return;
+            };
             self.next_seq += data.len() as u32;
         } else {
             tracing::trace!(%seq, "Storing data for later");
@@ -74,7 +79,12 @@ impl Connection {
         tracing::trace!(?self.packets, %self.next_seq, "Checking pending data");
         while let Some(data) = self.packets.remove(&self.next_seq) {
             tracing::trace!(data=%String::from_utf8_lossy(&data), "Sending data");
-            self.stream.write_all(&data).unwrap();
+            if let Err(e) = self.stream.write_all(&data) {
+                // just close the connection and abandon it
+                self.closed = true;
+                tracing::error!(%e, "Failed to write data");
+                return;
+            };
             self.next_seq += data.len() as u32;
         }
         if let Some(fin) = self.fin_seq {
@@ -180,7 +190,7 @@ impl ConnectionManager {
                 })
                 .map(|c| {
                     tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Got connection from pool");
-                    self.events.send((key, false)).unwrap();
+                    let _res = self.events.send((key, false));
                     c
                 })
             });
@@ -193,7 +203,7 @@ impl ConnectionManager {
 
     fn finished(&self, key: &ConnectionKey) {
         if let Some(_) = self.conn_map.remove(key) {
-            self.events.send((*key, true)).unwrap();
+            let _res = self.events.send((*key, true));
         }
     }
 }
@@ -373,7 +383,7 @@ fn forward_packet(
     };
     let vni = vxlan.get_vni();
     if vni != expected_vni {
-        tracing::warn!(%vni, "Invalid VNI");
+        tracing::trace!(%vni, "Invalid VNI");
         return None;
     }
     let Some(ethernet) = EthernetPacket::new(vxlan.payload()) else {
