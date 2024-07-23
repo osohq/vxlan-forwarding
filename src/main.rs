@@ -454,6 +454,8 @@ fn forward_packet(
         Ok(0) => {
             // connection closed
             tracing::debug!("Connection closed");
+            // signals to the pool that the connection is no longer valid
+            conn.closed = true;
         }
         Ok(n) => {
             tracing::trace!(?n, "Read bytes from connection");
