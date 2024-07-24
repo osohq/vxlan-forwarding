@@ -26,7 +26,7 @@ use pnet::{
 use r2d2::PooledConnection;
 
 type ConnectionKey = (u16, u16);
-type ConnectionMap = DashMap<ConnectionKey, r2d2::PooledConnection<TcpConnector>>;
+type ConnectionMap = DashMap<ConnectionKey, Connection>;
 
 struct Connection {
     stream: TcpStream,
@@ -152,6 +152,7 @@ struct ConnectionManager {
     conn_map: ConnectionMap,
     pool: r2d2::Pool<TcpConnector>,
     events: Sender<(ConnectionKey, bool)>,
+    addr: SocketAddr,
 }
 
 impl ConnectionManager {
@@ -161,38 +162,50 @@ impl ConnectionManager {
             .max_size(128)
             .min_idle(Some(4))
             .connection_timeout(Duration::from_secs(30))
-            .build(TcpConnector { addr: forward_addr })
+            .build(TcpConnector {
+                addr: forward_addr.clone(),
+            })
             .expect("Failed to create connection pool");
         Self {
             pool,
             conn_map,
             events,
+            addr: forward_addr,
         }
     }
 
     fn get_or_insert_connection(
         &self,
         key: ConnectionKey,
-    ) -> Result<dashmap::mapref::one::RefMut<'_, ConnectionKey, PooledConnection<TcpConnector>>, ()>
-    {
+    ) -> Result<dashmap::mapref::one::RefMut<'_, ConnectionKey, Connection>, ()> {
         let mut res = Err(());
 
         for _ in 0..3 {
-            res = self.conn_map
-            .entry(key)
-            .or_try_insert_with(|| {
+            res = self.conn_map.entry(key).or_try_insert_with(|| {
                 let start = std::time::Instant::now();
-                tracing::trace!(?key, "Getting connection from pool");
-                self.pool
-                .get()
-                .map_err(|e| {
-                    tracing::error!(%e, "Failed to get connection from pool");
-                })
-                .map(|c| {
-                    tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Got connection from pool");
-                    let _res = self.events.send((key, false));
-                    c
-                })
+                tracing::trace!(?key, "Initialize new connection");
+                let stream = TcpStream::connect(self.addr).map_err(|e| {
+                    tracing::error!(%e, "Failed to connect to forward address");
+                })?;
+                stream.set_nonblocking(true).map_err(|e| {
+                    tracing::error!(%e, "Failed to set non-blocking mode");
+                })?;
+                stream.set_nodelay(true).map_err(|e| {
+                    tracing::error!(%e, "Failed to set no delay");
+                })?;
+                tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Add new connection");
+                Ok(Connection::new(stream))
+                // tracing::trace!(?key, "Getting connection from pool");
+                // self.pool
+                // .get()
+                // .map_err(|e| {
+                //     tracing::error!(%e, "Failed to get connection from pool");
+                // })
+                // .map(|c| {
+                //     tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Got connection from pool");
+                //     let _res = self.events.send((key, false));
+                //     c
+                // })
             });
             if res.is_ok() {
                 break;
