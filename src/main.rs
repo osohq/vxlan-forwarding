@@ -77,6 +77,12 @@ impl Connection {
 
     fn check_pending(&mut self) {
         tracing::trace!(?self.packets, %self.next_seq, "Checking pending data");
+
+        if self.packets.len() > 1 {
+            tracing::debug!("More than one packet pending -- going to start sending data");
+            self.next_seq = self.packets.keys().next().copied().unwrap_or(self.next_seq);
+        }
+
         while let Some(data) = self.packets.remove(&self.next_seq) {
             tracing::trace!(data=%String::from_utf8_lossy(&data), "Sending data");
             if let Err(e) = self.stream.write_all(&data) {
