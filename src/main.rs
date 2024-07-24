@@ -150,7 +150,7 @@ impl r2d2::ManageConnection for TcpConnector {
 
 struct ConnectionManager {
     conn_map: ConnectionMap,
-    pool: r2d2::Pool<TcpConnector>,
+    // pool: r2d2::Pool<TcpConnector>,
     events: Sender<(ConnectionKey, bool)>,
     addr: SocketAddr,
 }
@@ -158,16 +158,16 @@ struct ConnectionManager {
 impl ConnectionManager {
     fn new(forward_addr: SocketAddr, events: Sender<(ConnectionKey, bool)>) -> Self {
         let conn_map: ConnectionMap = ConnectionMap::with_capacity_and_shard_amount(512, 32);
-        let pool = r2d2::Pool::builder()
-            .max_size(128)
-            .min_idle(Some(4))
-            .connection_timeout(Duration::from_secs(30))
-            .build(TcpConnector {
-                addr: forward_addr.clone(),
-            })
-            .expect("Failed to create connection pool");
+        // let pool = r2d2::Pool::builder()
+        //     .max_size(128)
+        //     .min_idle(Some(4))
+        //     .connection_timeout(Duration::from_secs(30))
+        //     .build(TcpConnector {
+        //         addr: forward_addr.clone(),
+        //     })
+        //     .expect("Failed to create connection pool");
         Self {
-            pool,
+            // pool,
             conn_map,
             events,
             addr: forward_addr,
@@ -274,7 +274,10 @@ fn main() {
     }
 
     tracing::info!("Starting up...");
-    let num_threads = num_cpus::get();
+    let num_threads = std::env::var("NUM_THREADS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(num_cpus::get);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
