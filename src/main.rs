@@ -23,7 +23,6 @@ use pnet::{
         Packet,
     },
 };
-use r2d2::PooledConnection;
 
 type ConnectionKey = (u16, u16);
 type ConnectionMap = DashMap<ConnectionKey, Connection>;
@@ -102,58 +101,6 @@ impl Connection {
     }
 }
 
-struct TcpConnector {
-    addr: SocketAddr,
-}
-
-impl r2d2::ManageConnection for TcpConnector {
-    type Connection = Connection;
-
-    type Error = std::io::Error;
-
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        let start = std::time::Instant::now();
-        let stream = TcpStream::connect(self.addr)?;
-        stream.set_nonblocking(true)?;
-        stream.set_nodelay(true)?;
-        tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Add new connection");
-        Ok(Connection::new(stream))
-    }
-
-    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        let mut buf = [0u8; 1];
-        match conn.stream.peek(&mut buf) {
-            Ok(0) => {
-                // connection closed
-                conn.closed = true;
-                tracing::debug!("Connection closed");
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "Connection closed",
-                ))
-            }
-            Ok(n) => {
-                tracing::trace!(?n, "Read bytes from connection");
-                Ok(())
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // no data to read
-                tracing::trace!("No data to read");
-                Ok(())
-            }
-            Err(e) => {
-                // failed to read from connection
-                tracing::error!(%e, "Failed to read from connection");
-                Err(e)
-            }
-        }
-    }
-
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        conn.closed
-    }
-}
-
 struct ConnectionManager {
     conn_map: ConnectionMap,
     // pool: r2d2::Pool<TcpConnector>,
@@ -186,6 +133,9 @@ impl ConnectionManager {
     ) -> Result<dashmap::mapref::one::RefMut<'_, ConnectionKey, Connection>, ()> {
         let mut res = Err(());
 
+        // check if the connection is live
+        self.check_connection(&key);
+
         for _ in 0..3 {
             res = self.conn_map.entry(key).or_try_insert_with(|| {
                 let start = std::time::Instant::now();
@@ -200,6 +150,9 @@ impl ConnectionManager {
                     tracing::error!(%e, "Failed to set no delay");
                 })?;
                 tracing::debug!(duration_ms=%start.elapsed().as_millis(), "Add new connection");
+                if let Err(e) = self.events.send((key, false)) {
+                    tracing::debug!(%e, "unexpected send error");
+                }
                 Ok(Connection::new(stream))
                 // tracing::trace!(?key, "Getting connection from pool");
                 // self.pool
@@ -213,6 +166,7 @@ impl ConnectionManager {
                 //     c
                 // })
             });
+
             if res.is_ok() {
                 break;
             }
@@ -220,8 +174,41 @@ impl ConnectionManager {
         res
     }
 
+    fn check_connection(&self, key: &ConnectionKey) {
+        let Some(mut conn) = self.conn_map.get_mut(key) else {
+            return;
+        };
+
+        let mut buf = Vec::new();
+        match conn.stream.read_to_end(&mut buf) {
+            Ok(0) => {
+                // connection closed
+                tracing::debug!("Connection closed");
+                // signals to the pool that the connection is no longer valid
+                conn.closed = true;
+            }
+            Ok(n) => {
+                tracing::trace!(?n, "Read bytes from connection");
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // no data to read
+                tracing::trace!("No data to read");
+            }
+            Err(e) => {
+                // failed to read from connection
+                tracing::error!(%e, "Failed to read from connection");
+                conn.closed = true;
+            }
+        }
+
+        if conn.closed {
+            drop(conn);
+            self.finished(key);
+        }
+    }
+
     fn finished(&self, key: &ConnectionKey) {
-        if let Some(_) = self.conn_map.remove(key) {
+        if self.conn_map.remove(key).is_some() {
             let _res = self.events.send((*key, true));
         }
     }
@@ -332,8 +319,8 @@ fn main() {
             let now = std::time::Instant::now();
             for (key, start) in connections.iter() {
                 if now.duration_since(*start) > Duration::from_secs(3) {
-                    tracing::info!("Connection timed out: {:?}", key);
-                    cm.finished(key);
+                    tracing::info!("Check connection liveness: {:?}", key);
+                    cm.check_connection(key);
                 }
             }
         }
@@ -353,7 +340,7 @@ fn main() {
                 let (_, mut rx) = match datalink::channel(&interface, channel_config) {
                     Ok(Channel::Ethernet(tx, rx)) => (tx, rx),
                     Ok(_) => panic!("packetdump: unhandled channel type"),
-                    Err(e) => panic!("packetdump: unable to create channel: {}", e),
+                    Err(e) => panic!("packetdump: unable to create channel: {e}"),
                 };
 
                 tracing::info_span!("thread", %i).in_scope(|| loop {
@@ -466,35 +453,8 @@ fn forward_packet(
     }
 
     if !payload.is_empty() {
-        tracing::trace!(payload=%String::from_utf8_lossy(&payload), "Forwarding payload");
+        tracing::trace!(payload=%String::from_utf8_lossy(payload), "Forwarding payload");
         conn.push_data(tcp.get_sequence(), payload);
-    }
-
-    // read as many bytes off the socket as we can
-    let mut buf = Vec::new();
-    match conn.stream.read_to_end(&mut buf) {
-        Ok(0) => {
-            // connection closed
-            tracing::debug!("Connection closed");
-            // signals to the pool that the connection is no longer valid
-            conn.closed = true;
-        }
-        Ok(n) => {
-            tracing::trace!(?n, "Read bytes from connection");
-        }
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            // no data to read
-            tracing::trace!("No data to read");
-        }
-        Err(e) => {
-            // failed to read from connection
-            tracing::error!(%e, "Failed to read from connection");
-        }
-    }
-
-    if conn.closed {
-        drop(conn);
-        conn_manager.finished(&key);
     }
 
     Some(())
