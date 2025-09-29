@@ -27,12 +27,19 @@ use pnet::{
 type ConnectionKey = (u16, u16);
 type ConnectionMap = DashMap<ConnectionKey, Connection>;
 
+const MAX_PENDING_PACKETS: &str = "MAX_PENDING_PACKETS";
+const MAX_PENDING_PACKETS_DEFAULT: usize = 1;
+const MAX_RETRIES: &str = "MAX_RETRIES";
+const MAX_RETRIES_DEFAULT: usize = 2;
+
 struct Connection {
     stream: TcpStream,
     closed: bool,
     packets: BTreeMap<u32, Vec<u8>>,
     next_seq: u32,
     fin_seq: Option<u32>,
+    max_pending_packets: usize,
+    max_retries: usize,
 }
 
 impl Connection {
@@ -43,6 +50,14 @@ impl Connection {
             packets: Default::default(),
             next_seq: 1,
             fin_seq: None,
+            max_pending_packets: std::env::var(MAX_PENDING_PACKETS)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(MAX_PENDING_PACKETS_DEFAULT),
+            max_retries: std::env::var(MAX_RETRIES)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(MAX_RETRIES_DEFAULT),
         }
     }
 
@@ -51,16 +66,42 @@ impl Connection {
         self.check_pending();
     }
 
+    // NOTE(sverch): This has no delay when it's retrying, it just tries to
+    // send as hard as possible until the data goes through. We are using a
+    // non blocking TCP connection, so this is what we need to do for the case
+    // where we would have to block. Since this is per connection, no one else
+    // should be blocked by this, but this does consume extra resources. The
+    // retries are tunable via an environment variable.
+    fn write_all_with_retries(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let mut remaining_retries = self.max_retries;
+        loop {
+            match self.stream.write_all(data) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if remaining_retries == 0 {
+                        return Err(e);
+                    }
+                    remaining_retries -= 1;
+                    continue;
+                }
+                r => {
+                    return r;
+                }
+            }
+        }
+    }
+
     fn push_data(&mut self, seq: u32, data: &[u8]) {
         if seq == self.next_seq {
             // eagerly send the data
             tracing::trace!(%seq, "this is already the next packet");
-            if let Err(e) = self.stream.write_all(data) {
+            if let Err(e) = self.write_all_with_retries(data) {
                 // just close the connection and abandon it
                 self.closed = true;
                 tracing::error!(%e, "Failed to write data");
                 return;
             };
+            // Every byte has its own sequence number, so bump this by the
+            // length of the data we just sent.
             self.next_seq += data.len() as u32;
         } else {
             tracing::trace!(%seq, "Storing data for later");
@@ -77,19 +118,21 @@ impl Connection {
     fn check_pending(&mut self) {
         tracing::trace!(?self.packets, %self.next_seq, "Checking pending data");
 
-        if self.packets.len() > 1 {
+        if self.packets.len() > self.max_pending_packets {
             tracing::debug!("More than one packet pending -- going to start sending data");
             self.next_seq = self.packets.keys().next().copied().unwrap_or(self.next_seq);
         }
 
         while let Some(data) = self.packets.remove(&self.next_seq) {
             tracing::trace!(data=%String::from_utf8_lossy(&data), "Sending data");
-            if let Err(e) = self.stream.write_all(&data) {
+            if let Err(e) = self.write_all_with_retries(&data) {
                 // just close the connection and abandon it
                 self.closed = true;
                 tracing::error!(%e, "Failed to write data");
                 return;
             };
+            // Every byte has its own sequence number, so bump this by the
+            // length of the data we just sent.
             self.next_seq += data.len() as u32;
         }
         if let Some(fin) = self.fin_seq {
@@ -219,16 +262,18 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<String>>();
 
-    let [_, interface, expected_vni, source_port, forward_addr] = &args[..] else {
+    let [_, interface, expected_vni, original_destination_port, forward_addr] = &args[..] else {
         println!(
-            "Usage: {} <interface> <vni> <source_port> <forward_addr>",
+            "Usage: {} <interface> <vni> <original_destination_port> <forward_addr>",
             args[0]
         );
         exit(1);
     };
-    // let [_, interface, source_port, forward_addr] =
+    // let [_, interface, original_destination_port, forward_addr] =
     //     ["packetdump", "dummy0", "8000", "127.0.0.1:8081"];
-    let source_port: u16 = source_port.parse().expect("failed to parse source port");
+    let original_destination_port: u16 = original_destination_port
+        .parse()
+        .expect("failed to parse source port");
     let expected_vni: u32 = expected_vni.parse().expect("failed to parse VNI");
 
     let forward_addr = forward_addr
@@ -346,7 +391,12 @@ fn main() {
                 tracing::info_span!("thread", %i).in_scope(|| loop {
                     match rx.next() {
                         Ok(packet) => {
-                            forward_packet(&conn_manager, source_port, expected_vni, packet);
+                            forward_packet(
+                                &conn_manager,
+                                original_destination_port,
+                                expected_vni,
+                                packet,
+                            );
                         }
                         Err(e) => {
                             tracing::error!("An error occurred while reading: {e}");
@@ -368,10 +418,18 @@ fn main() {
 
 fn forward_packet(
     conn_manager: &ConnectionManager,
-    source_port: u16,
+    original_destination_port: u16,
     expected_vni: u32,
     packet: &[u8],
 ) -> Option<()> {
+    // First, unwrap the packet. See
+    // https://docs.aws.amazon.com/vpc/latest/mirroring/traffic-mirroring-packet-formats.html
+    // for the packet format.
+
+    // AWS Traffic Mirroring Sends us this information as a UDP stream over
+    // ethernet, and we are using a raw socket so we have to unwrap
+    // everything. First, unwrap Ethernet, IP, and UDP, to get to the VXLAN
+    // packet.
     let packet = EthernetPacket::new(packet)?;
     if packet.get_ethertype() != EtherTypes::Ipv4 {
         tracing::trace!("not an IPv4 packet");
@@ -385,16 +443,56 @@ fn forward_packet(
         tracing::debug!("Not a UDP packet");
         return None;
     };
+
+    // From:
+    // https://docs.aws.amazon.com/vpc/latest/mirroring/traffic-mirroring-packet-formats.html
+    //
+    // > Source port — The port is determined by a 5-tuple hash of the
+    // > original L2 packet, for ICMP, TCP, and UDP flows. ...
+    //
+    // So this means that this port number is actually the result of hashing
+    // the following fields:
+    //
+    // ```
+    // (
+    //  tcp_source_port,
+    //  tcp_source_ip,
+    //  tcp_destination_port,
+    //  tcp_destination_ip,
+    //  protocol_number
+    // )
+    // ```
+    //
+    // This seems to be a convention in VXLAN, since the fact that UDP is a
+    // connectionless protocol means the receiver is often not using this
+    // value, so someone decided to put this extra information in here to
+    // distinguish different traffic flows. It's useful for us to separate the
+    // original client connections, so fetch that value here.
     let udp_source = udp.get_source();
+
+    // Unwrap the VXLAN packet. This represents a virtual LAN, which
+    // effectively means from this point on up this is a "normal" ethernet
+    // stream, except the traffic is a copy of the traffic that was received
+    // on the original interface.
     let Some(vxlan) = VxlanPacket::new(udp.payload()) else {
         tracing::debug!("Not a VXLAN packet");
         return None;
     };
+
+    // VXLAN can be used to create many virtual networks using the same
+    // physical network devices, and the VNI is used to distinguish them. We
+    // must set a VNI when we create the traffic mirror session, which will
+    // cause the packets that are sent over the mirrored connection to have
+    // that VNI. Skip any packets with an unexpected VNI.
     let vni = vxlan.get_vni();
     if vni != expected_vni {
-        tracing::trace!(%vni, "Invalid VNI");
+        // NOTE(sverch): Making this a warning, because this was likely a
+        // misconfiguration based on how we use this today.
+        tracing::warn!(%vni, "Received vxlan packet with unexpected VNI");
         return None;
     }
+
+    // Unwrap the original packet
     let Some(ethernet) = EthernetPacket::new(vxlan.payload()) else {
         tracing::warn!("Not an Ethernet packet");
         return None;
@@ -411,10 +509,15 @@ fn forward_packet(
         tracing::warn!("Not a TCP packet");
         return None;
     };
-    if tcp.get_destination() != source_port {
-        tracing::trace!("Not a packet for port {source_port}");
+    if tcp.get_destination() != original_destination_port {
+        tracing::trace!("Not a packet for port {original_destination_port}");
         return None;
     }
+
+    // Get the tcp source port, for extra specificity on the connection.
+    // NOTE(sverch): This might have been here originally out of confusion as
+    // to which "source port" was a result of the 5 tuple hash, but it doesn't
+    // seem worth taking it out right now in case that breaks something.
     let tcp_source = tcp.get_source();
     let key = (udp_source, tcp_source);
 
