@@ -119,7 +119,7 @@ impl Connection {
         tracing::trace!(?self.packets, %self.next_seq, "Checking pending data");
 
         if self.packets.len() > self.max_pending_packets {
-            tracing::debug!("More than one packet pending -- going to start sending data");
+            tracing::debug!("More than the configured maximum packets are pending -- going to start sending data");
             self.next_seq = self.packets.keys().next().copied().unwrap_or(self.next_seq);
         }
 
