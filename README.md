@@ -28,3 +28,10 @@ shouldn't be very high.
 
 Set `MAX_RETRIES` to configure how many times to retry on `EWOULDBLOCK` before
 giving up, since we use a non blocking TCP connection.
+
+## Concepts
+
+![Normal Network Stack](images/normal-network-stack.svg)
+
+
+![Traffic Mirroring](images/traffic-mirroring.svg)
