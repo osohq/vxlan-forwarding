@@ -64,7 +64,7 @@ our original packet as the data.
 
 This whole package gets sent to us via UDP. UDP is at the same layer as TCP,
 so just like with TCP, we also need to add the IP and Ethernet metadata to
-send it over the network out our replay service.
+send it over the network to our replay service.
 
 This results in the monstrous packet shown in the diagram.
 
