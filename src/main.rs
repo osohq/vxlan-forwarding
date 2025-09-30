@@ -273,7 +273,7 @@ fn main() {
     //     ["packetdump", "dummy0", "8000", "127.0.0.1:8081"];
     let original_destination_port: u16 = original_destination_port
         .parse()
-        .expect("failed to parse source port");
+        .expect("failed to parse original destination port");
     let expected_vni: u32 = expected_vni.parse().expect("failed to parse VNI");
 
     let forward_addr = forward_addr
