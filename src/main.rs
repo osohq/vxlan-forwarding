@@ -78,8 +78,10 @@ impl Connection {
             match self.stream.write_all(data) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if remaining_retries == 0 {
+                        tracing::warn!(%e, "Failed to write data, no retries remaining");
                         return Err(e);
                     }
+                    tracing::warn!(%e, %remaining_retries, "Failed to write data, retrying");
                     remaining_retries -= 1;
                     continue;
                 }
