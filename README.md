@@ -29,6 +29,17 @@ shouldn't be very high.
 Set `MAX_RETRIES` to configure how many times to retry on `EWOULDBLOCK` before
 giving up, since we use a non blocking TCP connection.
 
+## Building A New Binary
+
+The replay server is ARM64, so find a server with the ARM64 architecture (there
+are some debug servers running in AWS with ARM64), clone the repo, run the
+following, and commit and push the result:
+
+```bash
+cargo build --release
+cp target/release/vxlan-to-http ./vxlan-to-http-linux-aarch64
+```
+
 ## Concepts
 
 ![Normal Network Stack](images/normal-network-stack.svg)
