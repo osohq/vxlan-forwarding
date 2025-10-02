@@ -78,8 +78,10 @@ impl Connection {
             match self.stream.write_all(data) {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if remaining_retries == 0 {
+                        tracing::error!(%e, "Failed to write data, no retries remaining");
                         return Err(e);
                     }
+                    tracing::warn!(%e, %remaining_retries, "Failed to write data, retrying");
                     remaining_retries -= 1;
                     continue;
                 }
@@ -97,7 +99,7 @@ impl Connection {
             if let Err(e) = self.write_all_with_retries(data) {
                 // just close the connection and abandon it
                 self.closed = true;
-                tracing::error!(%e, "Failed to write data");
+                tracing::error!(%e, "Failed to eagerly write data");
                 return;
             };
             // Every byte has its own sequence number, so bump this by the
@@ -128,7 +130,7 @@ impl Connection {
             if let Err(e) = self.write_all_with_retries(&data) {
                 // just close the connection and abandon it
                 self.closed = true;
-                tracing::error!(%e, "Failed to write data");
+                tracing::error!(%e, "Failed to write buffered data");
                 return;
             };
             // Every byte has its own sequence number, so bump this by the
