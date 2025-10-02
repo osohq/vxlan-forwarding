@@ -29,6 +29,8 @@ shouldn't be very high.
 Set `MAX_RETRIES` to configure how many times to retry on `EWOULDBLOCK` before
 giving up, since we use a non blocking TCP connection.
 
+Set `RUST_LOG` to change the log level.
+
 ## Building A New Binary
 
 The replay server is ARM64, so find a server with the ARM64 architecture (there

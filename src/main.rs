@@ -81,7 +81,7 @@ impl Connection {
                         tracing::error!(%e, "Failed to write data, no retries remaining");
                         return Err(e);
                     }
-                    tracing::error!(%e, %remaining_retries, "Failed to write data, retrying");
+                    tracing::warn!(%e, %remaining_retries, "Failed to write data, retrying");
                     remaining_retries -= 1;
                     continue;
                 }
